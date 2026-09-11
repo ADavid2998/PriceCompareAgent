@@ -157,6 +157,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# price_agent.py user feedback log (local-only)
+feedback.log
+
 # Spyder project settings
 .spyderproject
 .spyproject

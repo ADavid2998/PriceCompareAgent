@@ -1,22 +1,36 @@
 """
-price_agent.py — An AI agent that searches the web for prices AND checks
-reviews, using two different kinds of tools so you can see both patterns.
+price_agent.py — An AI agent that searches the web for Australian retailer
+prices (in AUD) AND checks reviews, using two different kinds of tools so
+you can see both patterns.
 
 THE TWO TOOL TYPES:
-    1. web_search       — a SERVER-SIDE tool. Anthropic's own infrastructure
-                           runs the search; the result comes back already
-                           resolved inside the same API response. You never
-                           see stop_reason == "tool_use" for this one alone.
-    2. check_reviews     — a CLIENT-SIDE tool (this is a plain Python
-                           function). When Claude wants to call it, the API
-                           returns stop_reason == "tool_use" and hands you a
-                           tool_use block. YOUR CODE has to run the function
-                           and send the result back before Claude continues.
-                           This is the classic "agent loop."
+    1. web_search               — a SERVER-SIDE tool. Anthropic's own
+                                   infrastructure runs the search; the
+                                   result comes back already resolved
+                                   inside the same API response. You never
+                                   see stop_reason == "tool_use" for this
+                                   one alone.
+    2. ask_user_clarification,  — CLIENT-SIDE tools (plain Python
+       check_reviews              functions). When Claude wants to call
+                                   one, the API returns stop_reason ==
+                                   "tool_use" and hands you a tool_use
+                                   block. YOUR CODE has to run the function
+                                   and send the result back before Claude
+                                   continues. This is the classic "agent
+                                   loop."
 
 Mixing both in one request is intentional: it shows what happens when a
-server tool and a client tool both appear in the picture — the API resolves
-web_search on its own, but pauses for you on check_reviews.
+server tool and client tools all appear in the picture — the API resolves
+web_search on its own, but pauses for you on the other two.
+
+HANDLING VAGUE REQUESTS:
+    Claude decides for itself whether a query is specific enough to search
+    (e.g. "mechanical keyboard") or too vague (e.g. "keyboard"). For a vague
+    query it calls ask_user_clarification, which prints a short question and
+    a few concrete options at the console and blocks on input() until the
+    human answers. Once the request is resolved to a category rather than a
+    single product, Claude researches one specific model per price bracket
+    (Budget / Mid-range / Premium) and prices each of those.
 
 RATE LIMITING:
     Every API request is wrapped in call_with_retry(), which catches 429
@@ -25,11 +39,12 @@ RATE LIMITING:
     otherwise. Watch the console for [rate limit] messages if it kicks in.
 
 REQUIREMENTS:
-    pip install anthropic
-    export ANTHROPIC_API_KEY="your-key-here"
+    pip install anthropic python-dotenv
+    Put ANTHROPIC_API_KEY=your-key-here in a local .env file
 
 USAGE:
     python price_agent.py "Sony WH-1000XM5 headphones"
+    python price_agent.py "mechanical keyboard"   # will ask to narrow down
 """
 
 import sys
@@ -37,6 +52,7 @@ import json
 import time
 import random
 import anthropic
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()  # reads ANTHROPIC_API_KEY (and friends) from a local .env file
@@ -46,15 +62,40 @@ MODEL = "claude-sonnet-4-5"
 # How many times to retry a single API call after a 429 before giving up.
 MAX_RETRIES = 5
 
+FEEDBACK_LOG = "feedback.log"
+
 
 # ---------------------------------------------------------------------------
-# STEP 1: Define the client-side tool as a normal Python function.
+# STEP 1: Define the client-side tools as normal Python functions.
 #
-# This is a STUB — it returns made-up data so you can see the loop work
-# without needing a real reviews API. To make it real, replace the body
-# with a call to something like a retailer API, a scraping service, or
-# your own database of scraped reviews.
+# ask_user_clarification talks to the human; check_reviews is a STUB that
+# returns made-up data so you can see the loop work without needing a real
+# reviews API. To make check_reviews real, replace its body with a call to
+# something like a retailer API, a scraping service, or your own database
+# of scraped reviews.
 # ---------------------------------------------------------------------------
+def ask_user_clarification(question: str, options: list) -> dict:
+    """Pause the agent loop and ask the human at the console to narrow down
+    a vague request. Claude decides the question and the option list; we
+    just render it and collect the answer.
+    """
+    print(f"\n  [clarification needed] {question}")
+    for i, option in enumerate(options, start=1):
+        print(f"    {i}. {option}")
+    print(f"    {len(options) + 1}. Something else (type your own)")
+
+    choice = input("  Your choice: ").strip()
+
+    if choice.isdigit() and 1 <= int(choice) <= len(options):
+        answer = options[int(choice) - 1]
+    else:
+        # Either they picked "something else" or just typed free text —
+        # either way, use exactly what they typed.
+        answer = choice
+
+    return {"question": question, "answer": answer}
+
+
 def check_reviews(product: str, retailer: str) -> dict:
     print(f"    [tool call] check_reviews(product={product!r}, retailer={retailer!r})")
     # --- STUB DATA — replace with a real lookup in production ---
@@ -76,22 +117,58 @@ def check_reviews(product: str, retailer: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# STEP 2: Describe both tools to Claude.
-# web_search uses Anthropic's built-in schema (type + name).
-# check_reviews is a custom tool: we write its name, description, and the
-# JSON schema for its inputs ourselves — this is how Claude knows when and
-# how to call it.
+# STEP 2: Describe all three tools to Claude.
+# web_search uses Anthropic's built-in schema (type + name). The other two
+# are custom tools: we write their name, description, and the JSON schema
+# for their inputs ourselves — this is how Claude knows when and how to
+# call them.
 # ---------------------------------------------------------------------------
 TOOLS = [
     {
         "type": "web_search_20250305",
         "name": "web_search",
-        "max_uses": 5,
+        # Higher than a single-product lookup needs, since a resolved
+        # category (e.g. "mechanical keyboard") means researching 3 models
+        # across price brackets, each priced at multiple retailers.
+        "max_uses": 12,
         # Bias/restrict results to Australia so retailers and prices found
         # are relevant to an AU shopper (e.g. amazon.com.au, jbhifi.com.au).
         "user_location": {
             "type": "approximate",
             "country": "AU",
+        },
+    },
+    {
+        "name": "ask_user_clarification",
+        "description": (
+            "Ask the human a clarifying question when their request is too "
+            "vague to search effectively (e.g. just 'keyboard' or "
+            "'headphones', with no type, use case, or budget given). "
+            "Propose 3-5 concrete, mutually distinct options — the most "
+            "common ways people narrow this kind of request (sub-types or "
+            "use cases, not prices) — the human can also type a free-text "
+            "answer instead of picking one. "
+            "Use your own judgement about whether to call this: if the "
+            "request already specifies a product type, brand, or use case "
+            "(e.g. 'mechanical keyboard', 'noise cancelling headphones "
+            "under $200', 'Sony WH-1000XM5'), it is specific enough — do "
+            "NOT ask, just proceed and pick sensible options yourself. Call "
+            "this at most once per request."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "A short question narrowing down what the user wants, e.g. 'What kind of keyboard are you after?'",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "3-5 concrete options, e.g. ['Mechanical keyboard', 'Wireless/Bluetooth keyboard', 'Gaming keyboard', 'Compact/60% keyboard']",
+                },
+            },
+            "required": ["question", "options"],
         },
     },
     {
@@ -122,6 +199,8 @@ TOOLS = [
 
 def execute_client_tool(name: str, tool_input: dict):
     """Dispatch a client-side tool call to the right Python function."""
+    if name == "ask_user_clarification":
+        return ask_user_clarification(**tool_input)
     if name == "check_reviews":
         return check_reviews(**tool_input)
     raise ValueError(f"Unknown client-side tool: {name}")
@@ -170,19 +249,47 @@ def run_price_agent(product: str) -> str:
         {
             "role": "user",
             "content": (
-                f"Search the web and compare current prices for '{product}' "
-                "across at least 3 different retailers that sell to "
-                "customers in Australia (e.g. Amazon AU, JB Hi-Fi, "
-                "Officeworks, The Good Guys, Harvey Norman). Only consider "
-                "retailers that actually ship within or operate in "
-                "Australia — ignore US-only or other international-only "
-                "sellers. Report every price in AUD (convert if a source "
-                "quotes another currency, and note that it was converted). "
-                "For each retailer you find a price at, also call "
-                "check_reviews to get its rating. Return a markdown table: "
-                "Retailer | Price (AUD) | Rating | Notes. Then add one line "
-                "recommending the best value option, considering both price "
-                "and rating."
+                f"The user wants help buying: '{product}'.\n\n"
+                "STEP 1 — Resolve the request.\n"
+                "If this is too vague to search effectively (e.g. a bare "
+                "category like 'keyboard' or 'headphones' with no type, "
+                "use case, or budget), call ask_user_clarification with a "
+                "short question and 3-5 concrete options. If it's already "
+                "specific enough (a product type, model, or use case is "
+                "given, e.g. 'mechanical keyboard' or 'Sony WH-1000XM5'), "
+                "skip clarification entirely and use your own judgement to "
+                "proceed — don't ask just for the sake of asking.\n\n"
+                "STEP 2 — Research and price it.\n"
+                "If the resolved request names one specific product, "
+                "search the web and compare its current price across at "
+                "least 3 different retailers.\n"
+                "If it resolves to a category (e.g. 'mechanical "
+                "keyboard'), first pick one well-regarded specific model "
+                "for each of 3 price brackets — Budget, Mid-range, and "
+                "Premium (use sensible AUD ranges for this category) — "
+                "then find the current price for each of those 3 models "
+                "across at least 2 retailers.\n"
+                "In both cases: only consider retailers that actually "
+                "ship within or operate in Australia (e.g. Amazon AU, JB "
+                "Hi-Fi, Officeworks, The Good Guys, Harvey Norman) — "
+                "ignore US-only or other international-only sellers. "
+                "Report every price in AUD (convert if a source quotes "
+                "another currency, and note that it was converted). For "
+                "each retailer you find a price at, also call "
+                "check_reviews to get its rating.\n\n"
+                "STEP 3 — Report back.\n"
+                "Return a markdown table — add a 'Price Bracket' and "
+                "'Product' column if you researched a category — with "
+                "columns: [Price Bracket |] [Product |] Retailer | Price "
+                "(AUD) | Rating | Link | Notes. The Link column must be a "
+                "markdown link, e.g. [Buy](https://...), pointing to the "
+                "exact product page a price came from — use the URL from "
+                "the web_search result you read it off, not a guessed or "
+                "made-up URL; if you can't find a direct product page URL "
+                "for a row, put 'n/a' instead of inventing one. Then add "
+                "one line per bracket (or one line overall for a single "
+                "product) recommending the best value option, considering "
+                "both price and rating."
             ),
         }
     ]
@@ -193,7 +300,7 @@ def run_price_agent(product: str) -> str:
         response = call_with_retry(
             client,
             model=MODEL,
-            max_tokens=1500,
+            max_tokens=3000,
             messages=messages,
             tools=TOOLS,
         )
@@ -231,6 +338,11 @@ def run_price_agent(product: str) -> str:
         messages.append({"role": "user", "content": tool_results})
 
 
+def log_feedback(query: str, feedback: str) -> None:
+    with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().isoformat()}\tquery={query!r}\tfeedback={feedback!r}\n")
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print('Usage: python price_agent.py "product name"')
@@ -240,3 +352,10 @@ if __name__ == "__main__":
     print(f"Searching prices and reviews for: {product_query}\n")
     result = run_price_agent(product_query)
     print("\n" + result)
+
+    feedback = input(
+        "\nAny feedback on this search? (press Enter to skip): "
+    ).strip()
+    if feedback:
+        log_feedback(product_query, feedback)
+        print(f"Thanks - saved to {FEEDBACK_LOG}.")
