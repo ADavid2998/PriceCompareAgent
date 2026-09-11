@@ -32,6 +32,18 @@ HANDLING VAGUE REQUESTS:
     single product, Claude researches one specific model per price bracket
     (Budget / Mid-range / Premium) and prices each of those.
 
+FEEDBACK LOOP:
+    After each result, the console asks for optional feedback. Feedback
+    isn't just logged for later — it's appended to the SAME conversation
+    (run_agent_turn is called again on the same `messages` list) so Claude
+    re-searches with full context of what it already found. E.g. it search-
+    es an iPhone and defaults to the 256GB model; feedback like "I want the
+    512GB one instead" makes it re-search that specific variant rather than
+    starting over. This is also how you correct it — e.g. feedback saying a
+    price looks stale prompts it to re-verify against the retailer's own
+    product page. Every feedback string is still appended to feedback.log
+    (query + timestamp) as a record, whether or not it changes anything.
+
 RATE LIMITING:
     Every API request is wrapped in call_with_retry(), which catches 429
     (rate limit) errors and retries with backoff — honoring the server's
@@ -242,10 +254,8 @@ def call_with_retry(client: anthropic.Anthropic, **kwargs):
             time.sleep(wait_seconds)
 
 
-def run_price_agent(product: str) -> str:
-    client = anthropic.Anthropic()
-
-    messages = [
+def build_initial_messages(product: str) -> list:
+    return [
         {
             "role": "user",
             "content": (
@@ -274,9 +284,18 @@ def run_price_agent(product: str) -> str:
                 "Hi-Fi, Officeworks, The Good Guys, Harvey Norman) — "
                 "ignore US-only or other international-only sellers. "
                 "Report every price in AUD (convert if a source quotes "
-                "another currency, and note that it was converted). For "
-                "each retailer you find a price at, also call "
-                "check_reviews to get its rating.\n\n"
+                "another currency, and note that it was converted). Prefer "
+                "pricing you can confirm on the retailer's own current "
+                "product page over third-party comparison/aggregator "
+                "sites (e.g. PriceMe, GetPrice) or old ad copy — those go "
+                "stale; if a price only came from one of those, say so in "
+                "the Notes column instead of presenting it as confirmed "
+                "current pricing. If a product looks discontinued, out of "
+                "stock everywhere, or superseded by a newer model, say so "
+                "plainly in the Notes column (and name the newer model if "
+                "you find one) instead of quoting a stale price for it as "
+                "if it's still available. For each retailer you find a "
+                "price at, also call check_reviews to get its rating.\n\n"
                 "STEP 3 — Report back.\n"
                 "Return a markdown table — add a 'Price Bracket' and "
                 "'Product' column if you researched a category — with "
@@ -294,7 +313,15 @@ def run_price_agent(product: str) -> str:
         }
     ]
 
-    # --- THE AGENT LOOP ---
+
+def run_agent_turn(client: anthropic.Anthropic, messages: list) -> str:
+    """Run the tool-calling loop until Claude produces a final text answer.
+
+    `messages` is mutated in place with every assistant/tool-result turn, so
+    the caller can append a new user message (e.g. follow-up feedback) and
+    call this again to continue the SAME conversation — Claude keeps the
+    full history of what it already searched and found.
+    """
     # Keep sending requests until Claude stops asking for tool calls.
     while True:
         response = call_with_retry(
@@ -350,12 +377,41 @@ if __name__ == "__main__":
 
     product_query = " ".join(sys.argv[1:])
     print(f"Searching prices and reviews for: {product_query}\n")
-    result = run_price_agent(product_query)
+
+    client = anthropic.Anthropic()
+    messages = build_initial_messages(product_query)
+    result = run_agent_turn(client, messages)
     print("\n" + result)
 
-    feedback = input(
-        "\nAny feedback on this search? (press Enter to skip): "
-    ).strip()
-    if feedback:
+    # --- FEEDBACK LOOP ---
+    # Feedback isn't just logged — it's fed back into the SAME conversation
+    # so Claude can act on it (e.g. "get the 512GB model instead" or "that
+    # price looks stale, check the retailer's own page") and re-search with
+    # full context of what it already found, rather than starting over.
+    while True:
+        feedback = input(
+            "\nAny feedback on this search? (press Enter to finish): "
+        ).strip()
+        if not feedback:
+            break
+
         log_feedback(product_query, feedback)
-        print(f"Thanks - saved to {FEEDBACK_LOG}.")
+        print(f"(feedback saved to {FEEDBACK_LOG}; adjusting search...)")
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Feedback on the results above: {feedback}\n\n"
+                    "Adjust the search accordingly — re-search or "
+                    "re-verify only what the feedback calls into question "
+                    "(e.g. a different spec/model, a stale or unconfirmed "
+                    "price) and reuse anything already found that's still "
+                    "valid. Return an updated table in the same format as "
+                    "before, plus an updated one-line recommendation."
+                ),
+            }
+        )
+        result = run_agent_turn(client, messages)
+        print("\n" + result)
+
+    print("\nSession ended.")
